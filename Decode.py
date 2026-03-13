@@ -40,7 +40,7 @@ SAMPLE_WIDTH       = 2                                          # 16-bit
 BYTES_PER_SEC      = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH     # 176400
 
 # UDP chunk: 2820 bytes = ~16ms/packet (an toàn với Windows timer 15ms)
-DEFAULT_CHUNK_SIZE = 2820
+DEFAULT_CHUNK_SIZE = 1000
 
 # Decode mỗi lần 200ms PCM -> đẩy vào queue
 DECODE_CHUNK_MS    = 200
