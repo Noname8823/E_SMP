@@ -25,16 +25,17 @@ from g711_codec import (
 # ──────────────────────────────────────────────
 DEFAULT_IP = "192.168.1.100"
 DEFAULT_PORT = 5000
-DEFAULT_PCM_CHUNK_SIZE = 1000
 DECODE_CHUNK_MS = 200
 QUEUE_MAX_SECONDS = 2
 QUEUE_MAXSIZE = int(QUEUE_MAX_SECONDS * 1000 / DECODE_CHUNK_MS) + 4
-PREBUFFER_SECONDS = 0.5
+
+PCM_PREBUFFER_SECONDS = 2.0
+G711_PREBUFFER_SECONDS = 0.5
 
 MAGIC = b"\xAB\xCD"
 
 # ──────────────────────────────────────────────
-# DEBUG PYTHON LOG
+# DEBUG
 # ──────────────────────────────────────────────
 DBG_SHOW_CODEC_INFO = True
 DBG_SHOW_PACKET_HEADER = True
@@ -127,47 +128,20 @@ def build_end_packet(seq: int, pkt_type: int) -> bytes:
 
 
 # ──────────────────────────────────────────────
-# CODEC DISPATCH
+# DECODER THREADS
 # ──────────────────────────────────────────────
-def get_codec_config(codec: str) -> dict:
-    codec = codec.lower()
-
-    if codec == "pcm":
-        return get_pcm_config()
-
-    if codec in ("ulaw", "alaw"):
-        return get_g711_config(codec)
-
-    raise ValueError("codec phải là pcm, ulaw hoặc alaw")
-
-
-def encode_audio_chunk(codec: str, pcm_chunk: bytes) -> bytes:
-    codec = codec.lower()
-
-    if codec == "pcm":
-        return encode_pcm(pcm_chunk)
-    if codec == "ulaw":
-        return encode_ulaw(pcm_chunk)
-    if codec == "alaw":
-        return encode_alaw(pcm_chunk)
-
-    raise ValueError(f"codec không hợp lệ: {codec}")
-
-
-# ──────────────────────────────────────────────
-# DECODER THREAD
-# ──────────────────────────────────────────────
-def decoder_thread(
+def decoder_pcm_thread(
     filepath: str,
     payload_queue: queue.Queue,
     stop_event: threading.Event,
-    codec: str,
-    sample_rate: int,
-    channels: int,
-    sample_width: int,
 ):
     try:
-        print(f"[DECODE] Doc file: {filepath}")
+        cfg = get_pcm_config()
+        sample_rate = cfg["sample_rate"]
+        channels = cfg["channels"]
+        sample_width = cfg["sample_width"]
+
+        print(f"[DECODE PCM] Doc file: {filepath}")
         t0 = time.perf_counter()
 
         audio = AudioSegment.from_file(filepath)
@@ -176,7 +150,7 @@ def decoder_thread(
         audio = audio.set_sample_width(sample_width)
 
         dur_ms = len(audio)
-        print(f"[DECODE] Xong trong {time.perf_counter() - t0:.1f}s | Duration={dur_ms/1000:.1f}s")
+        print(f"[DECODE PCM] Xong trong {time.perf_counter() - t0:.1f}s | Duration={dur_ms/1000:.1f}s")
 
         ms = 0
         chunk_idx = 0
@@ -185,16 +159,16 @@ def decoder_thread(
             pcm_chunk = audio[ms:end_ms].raw_data
 
             if pcm_chunk:
-                payload = encode_audio_chunk(codec, pcm_chunk)
+                payload = encode_pcm(pcm_chunk)
                 payload_queue.put(payload, block=True, timeout=10.0)
 
                 chunk_idx += 1
                 if chunk_idx <= 3:
                     print(
-                        f"[DECODE CHUNK {chunk_idx}] "
+                        f"[PCM CHUNK {chunk_idx}] "
                         f"src_ms={ms}-{end_ms} "
                         f"pcm_in={len(pcm_chunk)}B "
-                        f"encoded_out={len(payload)}B"
+                        f"payload={len(payload)}B"
                     )
 
             ms = end_ms
@@ -202,25 +176,83 @@ def decoder_thread(
         payload_queue.put(None)
 
     except Exception as e:
-        print(f"[DECODE ERR] {e}")
+        print(f"[DECODE PCM ERR] {e}")
+        payload_queue.put(None)
+
+
+def decoder_g711_thread(
+    filepath: str,
+    payload_queue: queue.Queue,
+    stop_event: threading.Event,
+    law: str,
+):
+    try:
+        cfg = get_g711_config(law)
+        sample_rate = cfg["sample_rate"]
+        channels = cfg["channels"]
+        sample_width = cfg["sample_width"]
+
+        print(f"[DECODE {law.upper()}] Doc file: {filepath}")
+        t0 = time.perf_counter()
+
+        audio = AudioSegment.from_file(filepath)
+        audio = audio.set_frame_rate(sample_rate)
+        audio = audio.set_channels(channels)
+        audio = audio.set_sample_width(sample_width)
+
+        dur_ms = len(audio)
+        print(f"[DECODE {law.upper()}] Xong trong {time.perf_counter() - t0:.1f}s | Duration={dur_ms/1000:.1f}s")
+
+        ms = 0
+        chunk_idx = 0
+        while ms < dur_ms and not stop_event.is_set():
+            end_ms = min(ms + DECODE_CHUNK_MS, dur_ms)
+            pcm_chunk = audio[ms:end_ms].raw_data
+
+            if pcm_chunk:
+                if law == "ulaw":
+                    payload = encode_ulaw(pcm_chunk)
+                else:
+                    payload = encode_alaw(pcm_chunk)
+
+                payload_queue.put(payload, block=True, timeout=10.0)
+
+                chunk_idx += 1
+                if chunk_idx <= 3:
+                    print(
+                        f"[{law.upper()} CHUNK {chunk_idx}] "
+                        f"src_ms={ms}-{end_ms} "
+                        f"pcm_in={len(pcm_chunk)}B "
+                        f"payload={len(payload)}B"
+                    )
+
+            ms = end_ms
+
+        payload_queue.put(None)
+
+    except Exception as e:
+        print(f"[DECODE {law.upper()} ERR] {e}")
         payload_queue.put(None)
 
 
 # ──────────────────────────────────────────────
-# STREAM REAL-TIME
+# CORE SENDER
 # ──────────────────────────────────────────────
-def stream_realtime(filepath, esp32_ip, udp_port, chunk_size, codec="pcm", loop=False):
-    cfg = get_codec_config(codec)
-
-    sample_rate = cfg["sample_rate"]
-    channels = cfg["channels"]
-    sample_width = cfg["sample_width"]
-    tx_bytes_per_sec = cfg["tx_bytes_per_sec"]
-    pkt_type = cfg["pkt_type"]
-    default_chunk = cfg["default_chunk"]
-    align = cfg["align"]
-    label = cfg["label"]
-
+def run_stream_loop(
+    filepath: str,
+    esp32_ip: str,
+    udp_port: int,
+    chunk_size: int,
+    pkt_type: int,
+    label: str,
+    tx_bytes_per_sec: int,
+    default_chunk: int,
+    align: int,
+    prebuffer_seconds: float,
+    decoder_target,
+    decoder_args: tuple,
+    loop: bool = False,
+):
     if chunk_size is None or chunk_size <= 0:
         chunk_size = default_chunk
 
@@ -236,17 +268,14 @@ def stream_realtime(filepath, esp32_ip, udp_port, chunk_size, codec="pcm", loop=
     print(f"  File     : {filepath}")
     print(f"  Dest     : {esp32_ip}:{udp_port}")
     print(f"  Codec    : {label}")
-    print(f"  UDP chunk: {chunk_size}B = {interval*1000:.1f}ms/packet")
-    print(f"  Prebuffer: {PREBUFFER_SECONDS*1000:.0f}ms")
+    print(f"  UDP chunk: {chunk_size}B = {interval*1000:.2f}ms/packet")
+    print(f"  Prebuffer: {prebuffer_seconds*1000:.0f}ms")
     print(f"  OS       : {'Windows' if os.name == 'nt' else 'Linux/Mac'}")
     print("=" * 60)
 
     if DBG_SHOW_CODEC_INFO:
         print("[CFG]")
         print(f"  pkt_type        = {pkt_type} ({pkt_type_name(pkt_type)})")
-        print(f"  sample_rate     = {sample_rate}")
-        print(f"  channels        = {channels}")
-        print(f"  sample_width    = {sample_width}")
         print(f"  tx_bytes_per_sec= {tx_bytes_per_sec}")
         print(f"  default_chunk   = {default_chunk}")
         print(f"  align           = {align}")
@@ -270,22 +299,14 @@ def stream_realtime(filepath, esp32_ip, udp_port, chunk_size, codec="pcm", loop=
             stop_event = threading.Event()
 
             dec = threading.Thread(
-                target=decoder_thread,
-                args=(
-                    filepath,
-                    payload_queue,
-                    stop_event,
-                    codec,
-                    sample_rate,
-                    channels,
-                    sample_width,
-                ),
+                target=decoder_target,
+                args=decoder_args + (payload_queue, stop_event),
                 daemon=True,
                 name="Decoder",
             )
             dec.start()
 
-            prebuffer_bytes = int(tx_bytes_per_sec * PREBUFFER_SECONDS)
+            prebuffer_bytes = int(tx_bytes_per_sec * prebuffer_seconds)
             send_buf = bytearray()
             stream_done = False
 
@@ -429,6 +450,56 @@ def stream_realtime(filepath, esp32_ip, udp_port, chunk_size, codec="pcm", loop=
 
 
 # ──────────────────────────────────────────────
+# PCM STREAMER
+# ──────────────────────────────────────────────
+def stream_pcm(filepath, esp32_ip, udp_port, chunk_size, loop=False):
+    cfg = get_pcm_config()
+
+    run_stream_loop(
+        filepath=filepath,
+        esp32_ip=esp32_ip,
+        udp_port=udp_port,
+        chunk_size=chunk_size,
+        pkt_type=cfg["pkt_type"],
+        label=cfg["label"],
+        tx_bytes_per_sec=cfg["tx_bytes_per_sec"],
+        default_chunk=cfg["default_chunk"],
+        align=cfg["align"],
+        prebuffer_seconds=PCM_PREBUFFER_SECONDS,
+        decoder_target=lambda filepath, payload_queue, stop_event: decoder_pcm_thread(
+            filepath, payload_queue, stop_event
+        ),
+        decoder_args=(filepath,),
+        loop=loop,
+    )
+
+
+# ──────────────────────────────────────────────
+# G711 STREAMER
+# ──────────────────────────────────────────────
+def stream_g711(filepath, esp32_ip, udp_port, chunk_size, law, loop=False):
+    cfg = get_g711_config(law)
+
+    run_stream_loop(
+        filepath=filepath,
+        esp32_ip=esp32_ip,
+        udp_port=udp_port,
+        chunk_size=chunk_size,
+        pkt_type=cfg["pkt_type"],
+        label=cfg["label"],
+        tx_bytes_per_sec=cfg["tx_bytes_per_sec"],
+        default_chunk=cfg["default_chunk"],
+        align=cfg["align"],
+        prebuffer_seconds=G711_PREBUFFER_SECONDS,
+        decoder_target=lambda filepath, payload_queue, stop_event: decoder_g711_thread(
+            filepath, payload_queue, stop_event, law
+        ),
+        decoder_args=(filepath,),
+        loop=loop,
+    )
+
+
+# ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
 def main():
@@ -449,14 +520,35 @@ def main():
 
     print(f"[MAIN] codec arg = {args.codec}")
 
-    stream_realtime(
-        filepath=args.file,
-        esp32_ip=args.ip,
-        udp_port=args.port,
-        chunk_size=args.chunk,
-        codec=args.codec,
-        loop=args.loop,
-    )
+    if args.codec == "pcm":
+        stream_pcm(
+            filepath=args.file,
+            esp32_ip=args.ip,
+            udp_port=args.port,
+            chunk_size=args.chunk,
+            loop=args.loop,
+        )
+    elif args.codec == "ulaw":
+        stream_g711(
+            filepath=args.file,
+            esp32_ip=args.ip,
+            udp_port=args.port,
+            chunk_size=args.chunk,
+            law="ulaw",
+            loop=args.loop,
+        )
+    elif args.codec == "alaw":
+        stream_g711(
+            filepath=args.file,
+            esp32_ip=args.ip,
+            udp_port=args.port,
+            chunk_size=args.chunk,
+            law="alaw",
+            loop=args.loop,
+        )
+    else:
+        print(f"[LOI] codec khong hop le: {args.codec}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
