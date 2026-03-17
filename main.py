@@ -1,5 +1,3 @@
-# main.py
-
 import socket
 import time
 import argparse
@@ -25,20 +23,32 @@ from g711_codec import (
 # ──────────────────────────────────────────────
 DEFAULT_IP = "192.168.1.100"
 DEFAULT_PORT = 5000
-DECODE_CHUNK_MS = 200
-QUEUE_MAX_SECONDS = 2
-QUEUE_MAXSIZE = int(QUEUE_MAX_SECONDS * 1000 / DECODE_CHUNK_MS) + 4
 
-PCM_PREBUFFER_SECONDS = 2.0
+DECODE_CHUNK_MS = 40
+QUEUE_MAX_SECONDS = 2
+QUEUE_MAXSIZE = int(QUEUE_MAX_SECONDS * 1000 / DECODE_CHUNK_MS) + 8
+
+PCM_PREBUFFER_SECONDS = 1.0
 G711_PREBUFFER_SECONDS = 0.5
 
+# Gửi burst lúc đầu để ESP32 tích buffer
+STARTUP_BURST_PACKETS_PCM = 80
+STARTUP_BURST_PACKETS_G711 = 16
+
+# Giới hạn send_buf để không ăn quá nhiều RAM
+SEND_BUF_MAX_BYTES_PCM = 512 * 1024
+SEND_BUF_MAX_BYTES_G711 = 128 * 1024
+
 MAGIC = b"\xAB\xCD"
+
+PCM_TX_SPEEDUP = 1.01
+G711_TX_SPEEDUP = 1.00
 
 # ──────────────────────────────────────────────
 # DEBUG
 # ──────────────────────────────────────────────
 DBG_SHOW_CODEC_INFO = True
-DBG_SHOW_PACKET_HEADER = True
+DBG_SHOW_PACKET_HEADER = False
 DBG_PACKET_HEADER_COUNT = 10
 DBG_SHOW_END_PACKET = True
 
@@ -260,7 +270,12 @@ def run_stream_loop(
     if chunk_size <= 0:
         chunk_size = default_chunk
 
-    interval = chunk_size / tx_bytes_per_sec
+    if pkt_type == PKT_PCM:
+        effective_tx_bps = tx_bytes_per_sec * PCM_TX_SPEEDUP
+    else:
+        effective_tx_bps = tx_bytes_per_sec * G711_TX_SPEEDUP
+
+    interval = chunk_size / effective_tx_bps
 
     print("=" * 60)
     print("  UDP REAL-TIME STREAMER")
@@ -290,6 +305,14 @@ def run_stream_loop(
     run = 0
     stop_event = None
 
+    startup_burst_packets = (
+        STARTUP_BURST_PACKETS_PCM if pkt_type == PKT_PCM else STARTUP_BURST_PACKETS_G711
+    )
+
+    send_buf_max_bytes = (
+        SEND_BUF_MAX_BYTES_PCM if pkt_type == PKT_PCM else SEND_BUF_MAX_BYTES_G711
+    )
+
     try:
         while True:
             run += 1
@@ -308,19 +331,18 @@ def run_stream_loop(
 
             prebuffer_bytes = int(tx_bytes_per_sec * prebuffer_seconds)
             send_buf = bytearray()
-            stream_done = False
+            decoder_finished = False
 
             print(f"[STREAM] Prebuffer {prebuffer_bytes} bytes...")
-            while len(send_buf) < prebuffer_bytes:
+            while len(send_buf) < prebuffer_bytes and not decoder_finished:
                 try:
                     pc = payload_queue.get(timeout=10.0)
                 except queue.Empty:
                     print("[WARN] Timeout khi prebuffer")
-                    stream_done = True
                     break
 
                 if pc is None:
-                    stream_done = True
+                    decoder_finished = True
                     break
 
                 send_buf.extend(pc)
@@ -336,10 +358,47 @@ def run_stream_loop(
             next_send_time = t_start
             last_log_time = t_start
 
-            def send_from_buf():
-                nonlocal seq, sent_bytes, next_send_time, overruns, dbg_sent_count
+            # Startup burst: bơm nhanh lúc đầu cho ESP tích buffer
+            while len(send_buf) >= chunk_size and seq < startup_burst_packets:
+                pkt_payload = bytes(send_buf[:chunk_size])
+                del send_buf[:chunk_size]
 
-                while len(send_buf) >= chunk_size:
+                packet = build_packet(seq, pkt_type, pkt_payload)
+
+                if DBG_SHOW_PACKET_HEADER and dbg_sent_count < DBG_PACKET_HEADER_COUNT:
+                    print_packet_debug(
+                        tag=f"TX {dbg_sent_count + 1}",
+                        packet=packet,
+                        seq=seq,
+                        pkt_type=pkt_type,
+                        payload_len=len(pkt_payload),
+                    )
+                    dbg_sent_count += 1
+
+                sock.sendto(packet, dest)
+                seq += 1
+                sent_bytes += len(pkt_payload)
+
+            next_send_time = time.perf_counter()
+
+            while True:
+                # Chỉ hút thêm dữ liệu nếu send_buf chưa quá lớn
+                while len(send_buf) < send_buf_max_bytes:
+                    try:
+                        pc = payload_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    if pc is None:
+                        decoder_finished = True
+                        break
+
+                    send_buf.extend(pc)
+
+                now = time.perf_counter()
+
+                # Gửi đúng nhịp theo clock
+                if len(send_buf) >= chunk_size and now >= next_send_time:
                     pkt_payload = bytes(send_buf[:chunk_size])
                     del send_buf[:chunk_size]
 
@@ -360,34 +419,29 @@ def run_stream_loop(
                     sent_bytes += len(pkt_payload)
 
                     next_send_time += interval
-                    wait = next_send_time - time.perf_counter()
 
-                    if wait > 0:
-                        precise_sleep(wait)
-                    elif wait < -0.020:
+                    # Nếu trễ quá nhiều thì resync clock
+                    lag = time.perf_counter() - next_send_time
+                    if lag > 0.020:
                         overruns += 1
-                        next_send_time = time.perf_counter()
+                        next_send_time = time.perf_counter() + interval
 
-            send_from_buf()
+                    continue
 
-            while not stream_done:
-                try:
-                    pc = payload_queue.get(timeout=5.0)
-                except queue.Empty:
-                    print("[WARN] Queue timeout")
+                # Hết decoder và buffer không đủ 1 packet nữa thì thoát
+                if decoder_finished and len(send_buf) < chunk_size:
                     break
 
-                if pc is None:
-                    stream_done = True
+                wait = next_send_time - time.perf_counter()
+                if wait > 0.001:
+                    precise_sleep(min(wait, 0.002))
                 else:
-                    send_buf.extend(pc)
-
-                send_from_buf()
+                    time.sleep(0)
 
                 now = time.perf_counter()
                 if now - last_log_time >= 3.0:
                     last_log_time = now
-                    played = sent_bytes / tx_bytes_per_sec
+                    played = sent_bytes / effective_tx_bps
                     print(
                         f"  [{played:.0f}s played] "
                         f"buf={len(send_buf)}B "
