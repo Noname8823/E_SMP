@@ -41,7 +41,7 @@ SEND_BUF_MAX_BYTES_G711 = 128 * 1024
 
 MAGIC = b"\xAB\xCD"
 
-PCM_TX_SPEEDUP = 1.01
+PCM_TX_SPEEDUP = 1.00
 G711_TX_SPEEDUP = 1.00
 
 # ──────────────────────────────────────────────
